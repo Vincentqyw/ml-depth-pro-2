@@ -1,0 +1,7 @@
+.build/
+Models/
+build/
+build-device/
+DerivedData/
+xcuserdata/
+*.xcuserstate

@@ -141,6 +141,12 @@ uv run --extra coreml python -m demo.export stream -m depthpro2-s -w 4
 
 The [demo's README](demo/README.md) details the options, and shows how to export the model to Core ML and use it in your own app. It also has the runtime on an M4 Max MacBook Pro. For convenience, we also provide exported [Core ML models](https://huggingface.co/apple/DepthPro2-coreml/).
 
+## iPhone app
+
+`ios/` holds an iPhone app that runs the official Core ML packages live, in portrait or landscape.
+It needs an iPhone with iOS 26 and Xcode 16 or later; [its README](ios/README.md) covers the model
+download and build steps.
+
 ## Citation
 
 If you find our work useful, please cite the following paper:
