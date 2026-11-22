@@ -14,8 +14,8 @@ struct MetalView: UIViewRepresentable {
         view.colorPixelFormat = .bgra8Unorm
         view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         view.preferredFramesPerSecond = 60
-        view.enableSetNeedsDisplay = false
-        view.isPaused = false
+        view.enableSetNeedsDisplay = true
+        view.isPaused = true
         view.isOpaque = true
         view.backgroundColor = .black
         let renderer: Renderer
@@ -28,12 +28,16 @@ struct MetalView: UIViewRepresentable {
         renderer.blend = blend
         context.coordinator.renderer = renderer
         view.delegate = renderer
+        engine.setOnFrame { [weak view] in
+            DispatchQueue.main.async { view?.setNeedsDisplay() }
+        }
         return view
     }
 
     func updateUIView(_ view: MTKView, context: Context) {
         context.coordinator.renderer.mode = mode
         context.coordinator.renderer.blend = blend
+        view.setNeedsDisplay()
     }
 
     final class Coordinator {

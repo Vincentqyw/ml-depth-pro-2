@@ -41,12 +41,25 @@ struct GPU {
         #include <metal_stdlib>
         using namespace metal;
 
-        kernel void split_planar(texture2d<half, access::read> rgb [[texture(0)]],
-                                 texture2d<half, access::write> planar [[texture(1)]],
+        struct ResizeUniforms {
+            float2 sourceSize;
+            float2 scale;
+            float2 translate;
+        };
+
+        kernel void resize_split(texture2d<half, access::sample> source [[texture(0)]],
+                                 texture2d<half, access::write> camera [[texture(1)]],
+                                 texture2d<half, access::write> planar [[texture(2)]],
+                                 constant ResizeUniforms &u [[buffer(0)]],
                                  uint2 gid [[thread_position_in_grid]]) {
-            uint h = rgb.get_height();
-            if (gid.x >= rgb.get_width() || gid.y >= h) return;
-            half4 c = clamp(rgb.read(gid), 0.0h, 1.0h);
+            uint w = camera.get_width();
+            uint h = camera.get_height();
+            if (gid.x >= w || gid.y >= h) return;
+            constexpr sampler s(filter::linear, address::clamp_to_edge);
+            float2 destination = float2(gid) + 0.5;
+            float2 uv = ((destination - u.translate) / u.scale) / u.sourceSize;
+            half4 c = clamp(source.sample(s, uv), 0.0h, 1.0h);
+            camera.write(half4(c.rgb, 1.0h), gid);
             planar.write(half4(c.r), gid);
             planar.write(half4(c.g), uint2(gid.x, gid.y + h));
             planar.write(half4(c.b), uint2(gid.x, gid.y + 2 * h));

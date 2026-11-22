@@ -452,7 +452,7 @@ private struct InfoSheet: View {
                     VStack(spacing: 0) {
                         row("Temporal window", "\(model.info?.window ?? 4) frames")
                         Divider().overlay(.white.opacity(0.08))
-                        row("Compute", "GPU · float16")
+                        row("Compute", model.info?.computeLabel ?? "—")
                         Divider().overlay(.white.opacity(0.08))
                         row("Focal length", model.status.focalPixels.map { "\(Int($0)) px" } ?? "—")
                     }

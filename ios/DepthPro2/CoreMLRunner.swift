@@ -2,7 +2,6 @@ import CoreML
 import CoreVideo
 import Foundation
 import Metal
-import MetalPerformanceShaders
 import QuartzCore
 import Synchronization
 
@@ -46,13 +45,16 @@ struct ModelSpec: Sendable {
 struct ModelPackage: Identifiable, Hashable, Sendable {
     let name: String
     let preset: String
+    let window: Int
+    /// Exported as `<preset>_<H>x<W>_w<window>` for one size, instead of `<preset>_w<window>`.
+    let singleFunction: Bool
     let label: String
     let note: String
     let url: URL
 
     var id: String { name }
 
-    /// The bundled `DepthPro2-<preset>_w4.mlpackage` packages, fastest preset first.
+    /// The bundled `depthpro2-*.mlpackage` packages, fastest preset and window first.
     static func bundled() -> [ModelPackage] {
         guard let directory = Bundle.main.resourceURL?.appendingPathComponent("Models") else { return [] }
         let urls = (try? FileManager.default.contentsOfDirectory(
@@ -62,30 +64,53 @@ struct ModelPackage: Identifiable, Hashable, Sendable {
         return urls.compactMap { url -> ModelPackage? in
             guard url.pathExtension == "mlpackage" else { return nil }
             let name = url.deletingPathExtension().lastPathComponent
-            guard name.hasSuffix("_w4"),
-                  let preset = name.split(separator: "-").last?.split(separator: "_").first?.uppercased()
+            let parts = name.split(separator: "_")
+            guard parts.count == 2 || parts.count == 3,
+                  let suffix = parts.last, suffix.hasPrefix("w"), let window = Int(suffix.dropFirst()),
+                  let preset = parts.first?.split(separator: "-").last.map({ $0.uppercased() })
             else { return nil }
+            let singleFunction = parts.count == 3
+            let size = singleFunction ? parts[1].split(separator: "x").compactMap { Int($0) } : []
+            assert(size.isEmpty || size.count == 2, "A single-function package name must state its HxW.")
             return ModelPackage(
-                name: name, preset: preset, label: "Depth Pro 2 \(preset)",
-                note: notes[preset] ?? "Higher quality", url: url)
+                name: name, preset: preset, window: window, singleFunction: singleFunction,
+                label: "Depth Pro 2 \(preset) · W\(window)"
+                    + (size.count == 2 ? " · \(size[1])×\(size[0])" : ""),
+                note: singleFunction ? "Neural Engine · fastest"
+                    : window == 4 ? notes[preset] ?? "Higher quality" : "GPU · faster, less stable",
+                url: url)
         }
-        .sorted { (order[$0.preset] ?? 9) < (order[$1.preset] ?? 9) }
+        .sorted {
+            (order[$0.preset] ?? 9, -$0.window, $0.singleFunction ? 0 : 1, $0.name)
+                < (order[$1.preset] ?? 9, -$1.window, $1.singleFunction ? 0 : 1, $1.name)
+        }
     }
 }
 
 /// A package compiled once, so each function loads without compiling again.
 final class CompiledModelPackage: @unchecked Sendable {
     let url: URL
+    /// A package with a single function (exported with one size) runs on the Neural Engine;
+    /// iOS 26 rejects multifunction packages there, so those run on the GPU.
+    let singleFunction: Bool
 
     init(packageURL: URL) throws {
         url = try MLModel.compileModel(at: packageURL)
+        // Multifunction packages declare their functions in the model spec's metadata.
+        let spec = try Data(
+            contentsOf: packageURL.appendingPathComponent("Data/com.apple.CoreML/model.mlmodel"))
+        singleFunction = spec.range(of: Data("depthpro2.functions".utf8)) == nil
     }
 
     /// `function` of the package (nil: its default), with its spec and the package's resolutions.
     func load(function: String?) throws -> (model: MLModel, spec: ModelSpec, resolutions: [Resolution]) {
+        if singleFunction, let function, !function.isEmpty {
+            throw EngineError("The single-function package cannot load \(function).")
+        }
         let configuration = MLModelConfiguration()
-        configuration.computeUnits = .cpuAndGPU
-        if let function { configuration.functionName = function }
+        configuration.computeUnits = singleFunction ? .cpuAndNeuralEngine : .cpuAndGPU
+        configuration.allowLowPrecisionAccumulationOnGPU = true
+        if let function, !function.isEmpty { configuration.functionName = function }
         let model = try MLModel(contentsOf: url, configuration: configuration)
         let metadata = model.modelDescription.metadata[.creatorDefinedKey] as? [String: String] ?? [:]
         guard let preset = metadata["demo.preset"], let window = metadata["demo.window"].flatMap(Int.init) else {
@@ -100,7 +125,9 @@ final class CompiledModelPackage: @unchecked Sendable {
         let spec = ModelSpec(
             preset: preset, window: window, height: shape[2].intValue, width: shape[3].intValue)
         let names = metadata["depthpro2.functions"]?.split(separator: ",").map(String.init) ?? []
-        let resolutions = Resolution.list(names)
+        let resolutions = names.isEmpty
+            ? [Resolution(function: "", width: spec.width, height: spec.height)]
+            : Resolution.list(names)
         guard !resolutions.isEmpty else {
             throw EngineError("The model package lists no resolutions.")
         }
@@ -153,7 +180,7 @@ final class ResultSlot: @unchecked Sendable {
     fileprivate var readers = 0
 
     init(gpu: GPU, spec: ModelSpec) throws {
-        camera = try gpu.privateTexture(.rgba16Float, width: spec.width, height: spec.height)
+        camera = try gpu.privateTexture(.bgra8Unorm, width: spec.width, height: spec.height)
         inverseDepth = try makeHalfSurface(width: spec.width, height: spec.height)
         inverseDepthTexture = try gpu.texture(inverseDepth, format: .r16Float, usage: .shaderRead)
         let backing = MLMultiArray(
@@ -166,6 +193,7 @@ final class ResultPool: @unchecked Sendable {
     private let slots: [ResultSlot]
     private let condition = NSCondition()
     private var latest: ResultSlot?
+    var onPublish: (@Sendable () -> Void)?
 
     init(gpu: GPU, spec: ModelSpec, count: Int) throws {
         slots = try (0..<count).map { _ in try ResultSlot(gpu: gpu, spec: spec) }
@@ -184,6 +212,7 @@ final class ResultPool: @unchecked Sendable {
         condition.lock()
         latest = slot
         condition.unlock()
+        onPublish?()
     }
 
     func acquireLatest() -> ResultSlot? {
@@ -201,19 +230,23 @@ final class ResultPool: @unchecked Sendable {
     }
 }
 
+private struct ResizeUniforms {
+    var sourceSize: SIMD2<Float>
+    var scale: SIMD2<Float>
+    var translate: SIMD2<Float>
+}
+
 final class Preprocess {
     private let pipeline: MTLComputePipelineState
-    private let scaler: MPSImageLanczosScale
     private let textureCache: CVMetalTextureCache
     private let gpu: GPU
 
     init(gpu: GPU) throws {
         self.gpu = gpu
-        guard let function = gpu.library.makeFunction(name: "split_planar") else {
+        guard let function = gpu.library.makeFunction(name: "resize_split") else {
             throw EngineError("The preprocess shader is missing.")
         }
         pipeline = try gpu.device.makeComputePipelineState(function: function)
-        scaler = MPSImageLanczosScale(device: gpu.device)
         var cache: CVMetalTextureCache?
         CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, gpu.device, nil, &cache)
         guard let cache else { throw EngineError("Cannot create a Metal texture cache.") }
@@ -233,22 +266,21 @@ final class Preprocess {
         let (width, height) = (Double(camera.width), Double(camera.height))
         let scale = fillScale(
             from: (width: srcWidth, height: srcHeight), to: (width: camera.width, height: camera.height))
-        var transform = MPSScaleTransform(
-            scaleX: scale, scaleY: scale,
-            translateX: (width - Double(srcWidth) * scale) / 2,
-            translateY: (height - Double(srcHeight) * scale) / 2)
-        withUnsafePointer(to: &transform) { pointer in
-            scaler.scaleTransform = pointer
-            scaler.encode(commandBuffer: commands, sourceTexture: source, destinationTexture: camera)
-            scaler.scaleTransform = nil
-        }
+        var uniforms = ResizeUniforms(
+            sourceSize: SIMD2(Float(srcWidth), Float(srcHeight)),
+            scale: SIMD2(Float(scale), Float(scale)),
+            translate: SIMD2(
+                Float((width - Double(srcWidth) * scale) / 2),
+                Float((height - Double(srcHeight) * scale) / 2)))
 
         guard let encoder = commands.makeComputeCommandEncoder() else {
             throw EngineError("Cannot make a compute encoder.")
         }
         encoder.setComputePipelineState(pipeline)
-        encoder.setTexture(camera, index: 0)
-        encoder.setTexture(planar, index: 1)
+        encoder.setTexture(source, index: 0)
+        encoder.setTexture(camera, index: 1)
+        encoder.setTexture(planar, index: 2)
+        encoder.setBytes(&uniforms, length: MemoryLayout<ResizeUniforms>.stride, index: 0)
         encoder.dispatchThreads(
             MTLSize(width: camera.width, height: camera.height, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))

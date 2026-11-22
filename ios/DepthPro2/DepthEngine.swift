@@ -8,6 +8,9 @@ struct EngineInfo: Sendable {
     let preset: String
     let window: Int
     let resolutions: [Resolution]
+    let neuralEngine: Bool
+
+    var computeLabel: String { neuralEngine ? "Neural Engine · float16" : "GPU · float16" }
 }
 
 struct EngineStatus: Sendable {
@@ -152,7 +155,7 @@ private final class Camera: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
 final class DepthEngine: @unchecked Sendable {
     let gpu: GPU
     var info: EngineInfo { infoBox.withLock { $0 } }
-    private let cameraCover: (width: Int, height: Int)
+    private var cameraCover: (width: Int, height: Int)
     private let compiledBox: Mutex<CompiledModelPackage>
     private let infoBox: Mutex<EngineInfo>
     private let currentPackage: Mutex<ModelPackage>
@@ -165,11 +168,13 @@ final class DepthEngine: @unchecked Sendable {
     private let cameraBox = Mutex<Camera?>(nil)
     private let cameraGeneration = Atomic<Int>(0)
     private let nextGeneration = Atomic<Int>(1)
+    private let frameHandler: Mutex<(@Sendable () -> Void)?>
 
     init(package: ModelPackage) throws {
         gpu = try GPU()
         let compiled = try CompiledModelPackage(packageURL: package.url)
-        let (model, spec, resolutions) = try compiled.load(function: "res_640x360")
+        assert(package.singleFunction == compiled.singleFunction, "The package name and its functions disagree.")
+        let (model, spec, resolutions) = try compiled.load(function: nil)
         assert(resolutions.allSatisfy { $0.width > $0.height }, "The model functions must be landscape.")
         guard let initial = resolutions.first(where: { $0.width == spec.width && $0.height == spec.height }),
               let cover = resolutions.max(by: { $0.width * $0.height < $1.width * $1.height })
@@ -177,18 +182,34 @@ final class DepthEngine: @unchecked Sendable {
         cameraCover = (cover.width, cover.height)
         let runner = try ModelRunner(gpu: gpu, model: model, spec: spec)
         compiledBox = Mutex(compiled)
-        infoBox = Mutex(EngineInfo(preset: spec.preset, window: spec.window, resolutions: resolutions))
+        infoBox = Mutex(
+            EngineInfo(
+                preset: spec.preset, window: spec.window, resolutions: resolutions,
+                neuralEngine: compiled.singleFunction))
         currentPackage = Mutex(package)
         runnerBox = Mutex(runner)
         currentResolution = Mutex(initial)
         status = Mutex(EngineStatus())
+        frameHandler = Mutex(nil)
+        attach(runner)
+    }
+
+    /// Routes each published result to the view, including after a runner swap.
+    func setOnFrame(_ handler: (@Sendable () -> Void)?) {
+        frameHandler.withLock { $0 = handler }
+    }
+
+    private func attach(_ runner: ModelRunner) {
+        runner.pool.onPublish = { [weak self] in
+            self?.frameHandler.withLock { $0?() }
+        }
     }
 
     func start() async throws {
         guard await Self.requestCameraAccess() else {
             throw EngineError("Camera access is off. Allow it in Settings → Depth Pro 2 → Camera.")
         }
-        try await useCamera(position: .back)
+        try await useCamera(position: .back, covering: cameraCover)
         let thread = Thread { [self] in runInference() }
         thread.name = "depthpro2.inference"
         thread.qualityOfService = .userInteractive
@@ -213,6 +234,7 @@ final class DepthEngine: @unchecked Sendable {
             let (model, spec, _) = try compiled.load(function: resolution.function)
             return try ModelRunner(gpu: gpu, model: model, spec: spec)
         }.value
+        attach(runner)
         runnerBox.withLock { $0 = runner }
         currentResolution.withLock { $0 = resolution }
         status.withLock {
@@ -223,7 +245,7 @@ final class DepthEngine: @unchecked Sendable {
         }
     }
 
-    /// Switches to another preset at the current resolution. The new model is built before the old is dropped.
+    /// Switches to another package, at the matching resolution. The new model is built before the old is dropped.
     func selectModel(_ package: ModelPackage) async throws {
         guard package.name != currentPackage.withLock({ $0.name }) else { return }
         try beginSwitch("Loading \(package.label)…")
@@ -231,15 +253,30 @@ final class DepthEngine: @unchecked Sendable {
         let (resolution, gpu) = (self.resolution, self.gpu)
         let (compiled, runner, spec, resolutions) = try await Task.detached(priority: .userInitiated) {
             let compiled = try CompiledModelPackage(packageURL: package.url)
-            let (model, spec, resolutions) = try compiled.load(function: resolution.function)
+            let function = package.singleFunction ? nil : resolution.function
+            let (model, spec, resolutions) = try compiled.load(function: function)
             let runner = try ModelRunner(gpu: gpu, model: model, spec: spec)
             return (compiled, runner, spec, resolutions)
         }.value
-        assert(resolutions == info.resolutions, "All Depth Pro 2 packages must share their resolutions.")
+        assert(package.singleFunction == compiled.singleFunction, "The package name and its functions disagree.")
+        guard let next = resolutions.first(where: { $0.width == spec.width && $0.height == spec.height }),
+              let cover = resolutions.max(by: { $0.width * $0.height < $1.width * $1.height })
+        else { throw EngineError("The model package has no resolutions.") }
+        if cover.width * cover.height > cameraCover.width * cameraCover.height {
+            // Frame the new package's largest resolution without upscaling the camera feed.
+            try await useCamera(position: cameraPosition, covering: (cover.width, cover.height))
+            cameraCover = (cover.width, cover.height)
+        }
+        attach(runner)
         compiledBox.withLock { $0 = compiled }
         runnerBox.withLock { $0 = runner }
-        infoBox.withLock { $0 = EngineInfo(preset: spec.preset, window: spec.window, resolutions: resolutions) }
+        infoBox.withLock {
+            $0 = EngineInfo(
+                preset: spec.preset, window: spec.window, resolutions: resolutions,
+                neuralEngine: compiled.singleFunction)
+        }
         currentPackage.withLock { $0 = package }
+        currentResolution.withLock { $0 = next }
         status.withLock {
             $0.processedFPS = 0
             $0.stepMs = 0
@@ -252,7 +289,7 @@ final class DepthEngine: @unchecked Sendable {
         let position: AVCaptureDevice.Position = cameraPosition == .front ? .back : .front
         try beginSwitch("Switching camera…")
         defer { endSwitch() }
-        try await useCamera(position: position)
+        try await useCamera(position: position, covering: cameraCover)
     }
 
     /// Claims the one model/camera switch slot, so two loads cannot swap runners concurrently.
@@ -273,10 +310,12 @@ final class DepthEngine: @unchecked Sendable {
         cameraBox.withLock { $0?.position ?? .back }
     }
 
-    private func useCamera(position: AVCaptureDevice.Position) async throws {
+    private func useCamera(
+        position: AVCaptureDevice.Position, covering cover: (width: Int, height: Int)
+    ) async throws {
         let generation = nextGeneration.add(1, ordering: .relaxed).newValue
         let camera = try Camera(
-            position: position, generation: generation, covering: cameraCover.width, height: cameraCover.height,
+            position: position, generation: generation, covering: cover.width, height: cover.height,
             onFrame: { [weak self] image, time, focal in
                 self?.mailbox.putDroppingUnread(
                     CameraFrame(
