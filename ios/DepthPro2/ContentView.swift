@@ -34,8 +34,15 @@ private struct CameraScreen: View {
 
     var body: some View {
         ZStack {
-            MetalView(engine: engine, mode: model.mode.rawValue, blend: Float(model.blend))
+            MetalView(
+                engine: engine, mode: model.mode.rawValue, blend: Float(model.blend),
+                compare: model.mode == .compare)
                 .ignoresSafeArea()
+
+            if model.mode == .compare {
+                CompareLabels(model: model, compactHeight: verticalSizeClass == .compact)
+                    .allowsHitTesting(false)
+            }
 
             LinearGradient(
                 stops: [
@@ -47,6 +54,10 @@ private struct CameraScreen: View {
                 startPoint: .top, endPoint: .bottom)
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
+
+            if model.mode == .compare {
+                RegionSelection(model: model)
+            }
 
             VStack(spacing: 10) {
                 Header(model: model)
@@ -83,6 +94,88 @@ private struct CameraScreen: View {
         } message: {
             Text(model.alert ?? "")
         }
+    }
+}
+
+/// Labels the two panes the renderer draws: stacked in portrait, side by side in landscape.
+private struct CompareLabels: View {
+    let model: AppModel
+    let compactHeight: Bool
+
+    var body: some View {
+        let layout = compactHeight
+            ? AnyLayout(HStackLayout(spacing: 0)) : AnyLayout(VStackLayout(spacing: 0))
+        layout {
+            pane("DEPTH PRO 2", detail: model.currentResolution?.title ?? "")
+            pane("ARKIT LIDAR", detail: "256×192")
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 68)
+        .padding(.bottom, 150)
+    }
+
+    private func pane(_ title: String, detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Text(title)
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .tracking(1.2)
+                Text(detail)
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.5))
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .glass(Capsule())
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+}
+
+/// A draggable loupe over the compare panes: the pill reports the depths inside it.
+private struct RegionSelection: View {
+    @Bindable var model: AppModel
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .topLeading) {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { model.selectRegion(at: $0.location, in: geometry.size) })
+                if let point = model.regionPoint {
+                    RegionLoupe()
+                        .position(point)
+                        .allowsHitTesting(false)
+                }
+                if let point = model.regionMirrorPoint {
+                    RegionLoupe(mirrored: true)
+                        .position(point)
+                        .allowsHitTesting(false)
+                }
+            }
+            .onChange(of: geometry.size) { _, _ in model.clearRegion() }
+        }
+        .ignoresSafeArea()
+    }
+}
+
+private struct RegionLoupe: View {
+    /// The same disk in the other pane, drawn fainter.
+    var mirrored = false
+
+    var body: some View {
+        ZStack {
+            Circle().fill(.white.opacity(0.06))
+            Circle().stroke(.white.opacity(0.9), lineWidth: 1.5)
+            Rectangle().fill(.white.opacity(0.8)).frame(width: 1, height: 9)
+            Rectangle().fill(.white.opacity(0.8)).frame(width: 9, height: 1)
+        }
+        .frame(width: 2 * AppModel.regionRadius, height: 2 * AppModel.regionRadius)
+        .opacity(mirrored ? 0.55 : 1)
+        .shadow(color: .black.opacity(0.35), radius: 3)
     }
 }
 
@@ -208,6 +301,33 @@ private struct StatusPills: View {
                 .padding(.vertical, 7)
                 .glass(Capsule())
             }
+            if model.mode == .compare, let region = model.status.region {
+                HStack(spacing: 7) {
+                    Image(systemName: "scope")
+                    Text(String(format: "DP2 %.2f m · ARKit %.2f m · Δ %3.0f cm",
+                                region.model, region.arkit, region.error * 100))
+                        .monospacedDigit()
+                    Button { model.clearRegion() } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.white.opacity(0.45))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Clear the selected area")
+                }
+                .font(.system(size: 11, weight: .medium))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .glass(Capsule())
+            } else if model.mode == .compare, let error = model.status.arkitError {
+                HStack(spacing: 6) {
+                    Image(systemName: "ruler")
+                    Text(String(format: "median |Δ| %.0f cm vs ARKit", error * 100))
+                }
+                .font(.system(size: 11, weight: .medium))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .glass(Capsule())
+            }
         }
     }
 }
@@ -282,9 +402,9 @@ private struct Controls: View {
     var body: some View {
         HStack(spacing: 10) {
             HStack(spacing: 4) {
-                ForEach(ViewMode.allCases) { mode in
+                ForEach(model.availableModes) { mode in
                     Button {
-                        withAnimation(.snappy(duration: 0.24)) { model.mode = mode }
+                        withAnimation(.snappy(duration: 0.24)) { model.setMode(mode) }
                     } label: {
                         Image(systemName: mode.icon)
                             .font(.system(size: 16, weight: .semibold))
@@ -305,6 +425,8 @@ private struct Controls: View {
             CircleButton(systemName: "scope") { model.recalibrate() }
                 .accessibilityLabel("Recalibrate depth colors")
             CircleButton(systemName: "arrow.triangle.2.circlepath.camera") { model.flipCamera() }
+                .disabled(model.mode == .compare)
+                .opacity(model.mode == .compare ? 0.4 : 1)
                 .accessibilityLabel("Switch camera")
         }
     }

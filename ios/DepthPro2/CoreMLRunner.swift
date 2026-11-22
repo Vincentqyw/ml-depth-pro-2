@@ -170,6 +170,8 @@ final class ResultSlot: @unchecked Sendable {
     let camera: MTLTexture
     let inverseDepth: CVPixelBuffer
     let inverseDepthTexture: MTLTexture
+    /// The LiDAR depth ARKit measured for the same frame, in meters (256×192 on LiDAR iPhones).
+    let arkitDepth: MTLTexture
     let predictionOptions = MLPredictionOptions()
     var seq = -1
     var captureTime = 0.0
@@ -177,15 +179,35 @@ final class ResultSlot: @unchecked Sendable {
     var stepMs = 0.0
     var metricScale: Float = 0
     var depthRange = SIMD2<Float>.zero
+    /// The median absolute difference from ARKit, in meters.
+    var arkitError: Float?
     fileprivate var readers = 0
 
     init(gpu: GPU, spec: ModelSpec) throws {
-        camera = try gpu.privateTexture(.bgra8Unorm, width: spec.width, height: spec.height)
+        camera = try gpu.texture(.bgra8Unorm, width: spec.width, height: spec.height)
         inverseDepth = try makeHalfSurface(width: spec.width, height: spec.height)
         inverseDepthTexture = try gpu.texture(inverseDepth, format: .r16Float, usage: .shaderRead)
+        // Shared storage, because the LiDAR map is copied in from the CPU.
+        arkitDepth = try gpu.texture(.r32Float, width: 256, height: 192, storage: .shared)
         let backing = MLMultiArray(
             pixelBuffer: inverseDepth, shape: [1, spec.height, spec.width].map { NSNumber(value: $0) })
         predictionOptions.outputBackings = ["inverse_depth": backing]
+    }
+
+    func copyARKitDepth(_ depth: CVPixelBuffer) throws {
+        assert(CVPixelBufferGetPixelFormatType(depth) == kCVPixelFormatType_DepthFloat32)
+        assert(
+            CVPixelBufferGetWidth(depth) == arkitDepth.width
+                && CVPixelBufferGetHeight(depth) == arkitDepth.height,
+            "ARKit changed its depth map size.")
+        CVPixelBufferLockBaseAddress(depth, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(depth, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(depth) else {
+            throw EngineError("The ARKit depth map has no base address.")
+        }
+        arkitDepth.replace(
+            region: MTLRegionMake2D(0, 0, arkitDepth.width, arkitDepth.height), mipmapLevel: 0,
+            withBytes: base, bytesPerRow: CVPixelBufferGetBytesPerRow(depth))
     }
 }
 
@@ -237,16 +259,18 @@ private struct ResizeUniforms {
 }
 
 final class Preprocess {
-    private let pipeline: MTLComputePipelineState
+    private let bgraPipeline: MTLComputePipelineState
+    private let yuvPipeline: MTLComputePipelineState
     private let textureCache: CVMetalTextureCache
     private let gpu: GPU
 
     init(gpu: GPU) throws {
         self.gpu = gpu
-        guard let function = gpu.library.makeFunction(name: "resize_split") else {
-            throw EngineError("The preprocess shader is missing.")
-        }
-        pipeline = try gpu.device.makeComputePipelineState(function: function)
+        guard let bgra = gpu.library.makeFunction(name: "resize_split"),
+              let yuv = gpu.library.makeFunction(name: "resize_split_yuv")
+        else { throw EngineError("The preprocess shaders are missing.") }
+        bgraPipeline = try gpu.device.makeComputePipelineState(function: bgra)
+        yuvPipeline = try gpu.device.makeComputePipelineState(function: yuv)
         var cache: CVMetalTextureCache?
         CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, gpu.device, nil, &cache)
         guard let cache else { throw EngineError("Cannot create a Metal texture cache.") }
@@ -254,39 +278,56 @@ final class Preprocess {
     }
 
     func run(_ image: CVPixelBuffer, camera: MTLTexture, planar: MTLTexture) throws {
-        let (srcWidth, srcHeight) = (CVPixelBufferGetWidth(image), CVPixelBufferGetHeight(image))
-        var cvTexture: CVMetalTexture?
-        CVMetalTextureCacheCreateTextureFromImage(
-            kCFAllocatorDefault, textureCache, image, nil, .bgra8Unorm, srcWidth, srcHeight, 0,
-            &cvTexture)
-        guard let cvTexture, let source = CVMetalTextureGetTexture(cvTexture),
-              let commands = gpu.queue.makeCommandBuffer()
-        else { throw EngineError("Cannot wrap the camera frame as a texture.") }
+        let source = (width: CVPixelBufferGetWidth(image), height: CVPixelBufferGetHeight(image))
+        let yuv = CVPixelBufferGetPixelFormatType(image) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        var wrapped: [CVMetalTexture] = []
+        func plane(_ index: Int, _ format: MTLPixelFormat, _ width: Int, _ height: Int) throws -> MTLTexture {
+            var cvTexture: CVMetalTexture?
+            CVMetalTextureCacheCreateTextureFromImage(
+                kCFAllocatorDefault, textureCache, image, nil, format, width, height, index, &cvTexture)
+            guard let cvTexture, let texture = CVMetalTextureGetTexture(cvTexture) else {
+                throw EngineError("Cannot wrap the camera frame as a texture.")
+            }
+            wrapped.append(cvTexture)
+            return texture
+        }
+        let luma = yuv ? try plane(0, .r8Unorm, source.width, source.height) : nil
+        let chroma = yuv ? try plane(1, .rg8Unorm, source.width / 2, source.height / 2) : nil
+        let bgra = yuv ? nil : try plane(0, .bgra8Unorm, source.width, source.height)
 
         let (width, height) = (Double(camera.width), Double(camera.height))
-        let scale = fillScale(
-            from: (width: srcWidth, height: srcHeight), to: (width: camera.width, height: camera.height))
+        let scale = fillScale(from: source, to: (width: camera.width, height: camera.height))
         var uniforms = ResizeUniforms(
-            sourceSize: SIMD2(Float(srcWidth), Float(srcHeight)),
+            sourceSize: SIMD2(Float(source.width), Float(source.height)),
             scale: SIMD2(Float(scale), Float(scale)),
             translate: SIMD2(
-                Float((width - Double(srcWidth) * scale) / 2),
-                Float((height - Double(srcHeight) * scale) / 2)))
+                Float((width - Double(source.width) * scale) / 2),
+                Float((height - Double(source.height) * scale) / 2)))
 
-        guard let encoder = commands.makeComputeCommandEncoder() else {
-            throw EngineError("Cannot make a compute encoder.")
+        guard let commands = gpu.queue.makeCommandBuffer(),
+              let encoder = commands.makeComputeCommandEncoder()
+        else { throw EngineError("Cannot make a compute encoder.") }
+        if let luma, let chroma {
+            encoder.setComputePipelineState(yuvPipeline)
+            encoder.setTexture(luma, index: 0)
+            encoder.setTexture(chroma, index: 1)
+        } else if let bgra {
+            encoder.setComputePipelineState(bgraPipeline)
+            encoder.setTexture(bgra, index: 0)
+        } else {
+            throw EngineError("Cannot wrap the camera frame as a texture.")
         }
-        encoder.setComputePipelineState(pipeline)
-        encoder.setTexture(source, index: 0)
-        encoder.setTexture(camera, index: 1)
-        encoder.setTexture(planar, index: 2)
+        encoder.setTexture(camera, index: 2)
+        encoder.setTexture(planar, index: 3)
         encoder.setBytes(&uniforms, length: MemoryLayout<ResizeUniforms>.stride, index: 0)
         encoder.dispatchThreads(
             MTLSize(width: camera.width, height: camera.height, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
         encoder.endEncoding()
-        commands.commit()
-        commands.waitUntilCompleted()
+        withExtendedLifetime(wrapped) {
+            commands.commit()
+            commands.waitUntilCompleted()
+        }
         CVMetalTextureCacheFlush(textureCache, 0)
         if let error = commands.error { throw error }
     }
@@ -313,14 +354,116 @@ final class ModelRunner: @unchecked Sendable {
     }
 
     /// Runs the model on `image` into `slot` and returns how long processing and inference took.
-    func process(_ image: CVPixelBuffer, into slot: ResultSlot) throws -> (preprocessMs: Double, stepMs: Double) {
+    func process(
+        _ image: CVPixelBuffer, sceneDepth: CVPixelBuffer?, into slot: ResultSlot
+    ) throws -> (preprocessMs: Double, stepMs: Double) {
         let preprocessStart = CACurrentMediaTime()
         try preprocess.run(image, camera: slot.camera, planar: planar)
+        if let sceneDepth {
+            try slot.copyARKitDepth(sceneDepth)
+        }
         let stepStart = CACurrentMediaTime()
         try stream.step(predictionOptions: slot.predictionOptions)
         let end = CACurrentMediaTime()
         return (1000 * (stepStart - preprocessStart), 1000 * (end - stepStart))
     }
+}
+
+/// A disk of the model's input image, in its pixels.
+struct DepthRegion: Sendable, Equatable {
+    var center: SIMD2<Float>
+    var radius: Float
+
+    func contains(_ x: Int, _ y: Int) -> Bool {
+        let dx = Float(x) + 0.5 - center.x
+        let dy = Float(y) + 0.5 - center.y
+        return dx * dx + dy * dy <= radius * radius
+    }
+}
+
+/// Depth Pro 2 and ARKit's depth over a region of the image, in meters.
+struct RegionStats: Sendable, Equatable {
+    let model: Float
+    let arkit: Float
+    let error: Float
+}
+
+/// The median absolute difference between the model's depth and ARKit's, in meters, over the
+/// pixels where ARKit is confident and both estimates are valid, and the same statistics within
+/// `region`, if it has enough samples.
+func depthComparison(
+    inverseDepth: CVPixelBuffer, sceneDepth: CVPixelBuffer, image: CVPixelBuffer,
+    confidence: CVPixelBuffer?, scale: Double, spec: ModelSpec, region: DepthRegion?
+) -> (error: Float?, region: RegionStats?) {
+    let arkit = (width: CVPixelBufferGetWidth(sceneDepth), height: CVPixelBufferGetHeight(sceneDepth))
+    // The map covers the camera image's field of view, which is what makes sampling it at the same
+    // normalized coordinates correct.
+    assert(
+        abs(Double(arkit.width) / Double(arkit.height)
+            - Double(CVPixelBufferGetWidth(image)) / Double(CVPixelBufferGetHeight(image))) < 0.01,
+        "ARKit's depth map and camera image have different fields of view.")
+    let fill = fillScale(from: arkit, to: (width: spec.width, height: spec.height))
+    let offset = (
+        x: (Double(spec.width) - Double(arkit.width) * fill) / 2,
+        y: (Double(spec.height) - Double(arkit.height) * fill) / 2)
+    CVPixelBufferLockBaseAddress(inverseDepth, .readOnly)
+    CVPixelBufferLockBaseAddress(sceneDepth, .readOnly)
+    if let confidence { CVPixelBufferLockBaseAddress(confidence, .readOnly) }
+    defer {
+        CVPixelBufferUnlockBaseAddress(inverseDepth, .readOnly)
+        CVPixelBufferUnlockBaseAddress(sceneDepth, .readOnly)
+        if let confidence { CVPixelBufferUnlockBaseAddress(confidence, .readOnly) }
+    }
+    guard let modelBase = CVPixelBufferGetBaseAddress(inverseDepth),
+          let depthBase = CVPixelBufferGetBaseAddress(sceneDepth)
+    else { return (nil, nil) }
+    let (modelRowBytes, depthRowBytes) = (
+        CVPixelBufferGetBytesPerRow(inverseDepth), CVPixelBufferGetBytesPerRow(sceneDepth))
+    let confidenceBase = confidence.flatMap { CVPixelBufferGetBaseAddress($0) }
+    let confidenceRowBytes = confidence.map { CVPixelBufferGetBytesPerRow($0) } ?? 0
+    var errors: [Float] = []
+    var regionErrors: [Float] = []
+    var regionModel: [Float] = []
+    var regionARKit: [Float] = []
+    let step = 2
+    for y in stride(from: 0, to: arkit.height, by: step) {
+        let depthRow = (depthBase + y * depthRowBytes).assumingMemoryBound(to: Float.self)
+        let confidenceRow = confidenceBase.map {
+            ($0 + y * confidenceRowBytes).assumingMemoryBound(to: UInt8.self)
+        }
+        let modelY = Int(offset.y + (Double(y) + 0.5) * fill)
+        guard modelY >= 0, modelY < spec.height else { continue }
+        let modelRow = (modelBase + modelY * modelRowBytes).assumingMemoryBound(to: Float16.self)
+        for x in stride(from: 0, to: arkit.width, by: step) {
+            if let confidenceRow, confidenceRow[x] < 2 { continue }
+            let measured = depthRow[x]
+            guard measured.isFinite, measured > 0.2, measured < 5 else { continue }
+            let modelX = Int(offset.x + (Double(x) + 0.5) * fill)
+            guard modelX >= 0, modelX < spec.width else { continue }
+            let inverse = modelRow[modelX]
+            guard inverse.isFinite, inverse > 0 else { continue }
+            let model = Float(scale / Double(inverse))
+            let difference = abs(model - measured)
+            errors.append(difference)
+            if region?.contains(modelX, modelY) == true {
+                regionModel.append(model)
+                regionARKit.append(measured)
+                regionErrors.append(difference)
+            }
+        }
+    }
+    let error = errors.count >= 100 ? median(errors) : nil
+    guard regionModel.count >= 10 else { return (error, nil) }
+    return (
+        error,
+        RegionStats(
+            model: median(regionModel), arkit: median(regionARKit), error: median(regionErrors)))
+}
+
+/// The middle of a non-empty sample.
+private func median(_ values: [Float]) -> Float {
+    assert(!values.isEmpty, "The median needs a sample.")
+    return values.sorted()[values.count / 2]
 }
 
 func metricScale(focalPixels: Double, frame: CVPixelBuffer, spec: ModelSpec) -> Double {

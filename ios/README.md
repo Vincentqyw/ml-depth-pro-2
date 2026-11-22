@@ -2,7 +2,8 @@
 
 An iPhone app that runs Apple's official Core ML Depth Pro 2 packages live in portrait or
 landscape, with a camera/depth compare view, a metric depth color bar and a selectable temporal
-window.
+window. On LiDAR iPhones, a compare mode shows Depth Pro 2 next to ARKit's own scene depth and
+reports how far apart they are.
 
 ## Models
 
@@ -45,6 +46,26 @@ Switching to a package with larger functions restarts the camera at a format tha
 
 The model functions are landscape, so in portrait the camera frame is inferred sideways and the
 displayable camera/depth result is rotated to the interface; the metric scale is unaffected.
+
+## Compare with ARKit
+
+The compare mode (`ViewMode.compare`) runs ARKit in place of the capture session, because the two
+cannot use the camera at once, and shows Depth Pro 2's metric depth beside ARKit's LiDAR scene
+depth, cropped to the model's 16:9 field of view and colored on the same range. A pill reports the
+median absolute difference in meters over the pixels where ARKit is confident; switching cameras or
+leaving the mode restarts the capture session.
+
+Tap or drag anywhere over either pane to place a loupe. The pill then reports the median Depth Pro 2
+depth, the median ARKit depth and their median difference inside that disk, and a fainter copy marks
+the same disk in the other pane; the × clears it. The loupe is cleared when the model, the
+resolution or the layout changes.
+
+The mode is listed only on LiDAR iPhones (`ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)`),
+enables `.sceneDepth` on `ARWorldTrackingConfiguration`, and feeds `frame.capturedImage` (full-range
+YUV, which the preprocess shader converts) to the same pipeline. ARKit reports the camera's focal
+length, so the meter conversion uses its `camera.intrinsics` instead of the capture format's field
+of view. Compare mode runs slower, as ARKit's tracking shares the GPU with the model: on an iPhone
+15 Pro Max with S at 854×480 and W4, 2.2 fps (398 ms) against 4.0 fps (231 ms) on the plain camera.
 
 ## Build and run
 

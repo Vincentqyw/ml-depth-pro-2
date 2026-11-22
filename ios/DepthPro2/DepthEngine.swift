@@ -1,3 +1,4 @@
+import ARKit
 import AVFoundation
 import CoreVideo
 import Foundation
@@ -19,6 +20,10 @@ struct EngineStatus: Sendable {
     var latencyMs = 0.0
     var focalPixels: Double?
     var depthRange: ClosedRange<Double>?
+    /// The median absolute difference from ARKit's LiDAR depth, in meters.
+    var arkitError: Float?
+    /// The median depths inside the selected compare region, in meters.
+    var region: RegionStats?
     var calibrating = true
     var switching: String?
     var error: String?
@@ -29,6 +34,8 @@ private struct CameraFrame: @unchecked Sendable {
     let image: CVPixelBuffer
     let captureTime: Double
     let focalPixels: Double
+    let sceneDepth: CVPixelBuffer?
+    let confidence: CVPixelBuffer?
 }
 
 private final class Mailbox: Sendable {
@@ -152,9 +159,61 @@ private final class Camera: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     }
 }
 
+/// ARKit's camera, which also measures LiDAR depth for every frame. A capture session and an AR
+/// session cannot share the camera, so compare mode swaps this in for `Camera`.
+private final class ARCamera: NSObject, ARSessionDelegate, @unchecked Sendable {
+    private let session = ARSession()
+    private let onFrame: @Sendable (CVPixelBuffer, CVPixelBuffer, CVPixelBuffer?, Double, Double) -> Void
+    private let onError: @Sendable (Error) -> Void
+
+    init(
+        onFrame: @escaping @Sendable (CVPixelBuffer, CVPixelBuffer, CVPixelBuffer?, Double, Double) -> Void,
+        onError: @escaping @Sendable (Error) -> Void
+    ) throws {
+        guard ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) else {
+            throw EngineError("This iPhone has no LiDAR scene depth.")
+        }
+        self.onFrame = onFrame
+        self.onError = onError
+        super.init()
+        session.delegate = self
+    }
+
+    func start() {
+        let configuration = ARWorldTrackingConfiguration()
+        configuration.frameSemantics = [.sceneDepth]
+        configuration.planeDetection = []
+        configuration.environmentTexturing = .none
+        session.run(configuration)
+    }
+
+    func stop() { session.pause() }
+
+    func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        guard let sceneDepth = frame.sceneDepth else { return }
+        assert(
+            CVPixelBufferGetPixelFormatType(frame.capturedImage)
+                == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            "ARKit delivers a full-range YUV camera image.")
+        onFrame(
+            frame.capturedImage, sceneDepth.depthMap, sceneDepth.confidenceMap, frame.timestamp,
+            Double(frame.camera.intrinsics.columns.0.x))
+    }
+
+    func session(_ session: ARSession, didFailWithError error: Error) {
+        onError(error)
+    }
+}
+
 final class DepthEngine: @unchecked Sendable {
+    /// Whether this iPhone can measure LiDAR scene depth (the Pro models).
+    static var sceneDepthSupported: Bool {
+        ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
+    }
+
     let gpu: GPU
     var info: EngineInfo { infoBox.withLock { $0 } }
+    var compareEnabled: Bool { compareBox.withLock { $0 } }
     private var cameraCover: (width: Int, height: Int)
     private let compiledBox: Mutex<CompiledModelPackage>
     private let infoBox: Mutex<EngineInfo>
@@ -166,6 +225,9 @@ final class DepthEngine: @unchecked Sendable {
     private let processing = NSLock()
     private let mailbox = Mailbox()
     private let cameraBox = Mutex<Camera?>(nil)
+    private let arCameraBox = Mutex<ARCamera?>(nil)
+    private let compareBox = Mutex(false)
+    private let regionBox = Mutex<DepthRegion?>(nil)
     private let cameraGeneration = Atomic<Int>(0)
     private let nextGeneration = Atomic<Int>(1)
     private let frameHandler: Mutex<(@Sendable () -> Void)?>
@@ -224,6 +286,12 @@ final class DepthEngine: @unchecked Sendable {
 
     func recalibrate() { recalibration.withLock { $0 = true } }
 
+    /// Sets the disk of the model image whose depths the compare mode reports.
+    func setRegion(_ region: DepthRegion?) {
+        regionBox.withLock { $0 = region }
+        if region == nil { status.withLock { $0.region = nil } }
+    }
+
     /// Runs the model at `resolution`. The new model is built before the old one is dropped.
     func select(_ resolution: Resolution) async throws {
         guard resolution != self.resolution else { return }
@@ -240,6 +308,7 @@ final class DepthEngine: @unchecked Sendable {
         status.withLock {
             $0.processedFPS = 0
             $0.stepMs = 0
+            $0.arkitError = nil
             $0.error = nil
             $0.calibrating = true
         }
@@ -264,7 +333,9 @@ final class DepthEngine: @unchecked Sendable {
         else { throw EngineError("The model package has no resolutions.") }
         if cover.width * cover.height > cameraCover.width * cameraCover.height {
             // Frame the new package's largest resolution without upscaling the camera feed.
-            try await useCamera(position: cameraPosition, covering: (cover.width, cover.height))
+            if !compareEnabled {
+                try await useCamera(position: cameraPosition, covering: (cover.width, cover.height))
+            }
             cameraCover = (cover.width, cover.height)
         }
         attach(runner)
@@ -280,16 +351,64 @@ final class DepthEngine: @unchecked Sendable {
         status.withLock {
             $0.processedFPS = 0
             $0.stepMs = 0
+            $0.arkitError = nil
             $0.error = nil
             $0.calibrating = true
         }
     }
 
     func flipCamera() async throws {
+        guard !compareEnabled else { throw EngineError("Exit compare mode to switch cameras.") }
         let position: AVCaptureDevice.Position = cameraPosition == .front ? .back : .front
         try beginSwitch("Switching camera…")
         defer { endSwitch() }
         try await useCamera(position: position, covering: cameraCover)
+    }
+
+    /// Swaps the camera for ARKit's, which measures LiDAR depth, and back.
+    func setCompare(_ enabled: Bool) async throws {
+        guard enabled != compareEnabled else { return }
+        try beginSwitch(enabled ? "Starting ARKit depth…" : "Returning to the camera…")
+        defer { endSwitch() }
+        let generation = nextGeneration.add(1, ordering: .relaxed).newValue
+        if enabled {
+            let camera = try ARCamera(
+                onFrame: { [weak self] image, depth, confidence, time, focal in
+                    self?.mailbox.putDroppingUnread(
+                        CameraFrame(
+                            generation: generation, image: image, captureTime: time,
+                            focalPixels: focal, sceneDepth: depth, confidence: confidence))
+                },
+                onError: { [weak self] error in
+                    self?.status.withLock { $0.error = error.localizedDescription }
+                })
+            cameraBox.withLock { $0 }?.stop()
+            camera.start()
+            arCameraBox.withLock { $0 = camera }
+            compareBox.withLock { $0 = true }
+        } else {
+            let camera = try Camera(
+                position: cameraPosition, generation: generation, covering: cameraCover.width,
+                height: cameraCover.height,
+                onFrame: { [weak self] image, time, focal in
+                    self?.mailbox.putDroppingUnread(
+                        CameraFrame(
+                            generation: generation, image: image, captureTime: time,
+                            focalPixels: focal, sceneDepth: nil, confidence: nil))
+                })
+            arCameraBox.withLock { $0 }?.stop()
+            arCameraBox.withLock { $0 = nil }
+            camera.start()
+            cameraBox.withLock { $0 = camera }
+            compareBox.withLock { $0 = false }
+        }
+        cameraGeneration.store(generation, ordering: .releasing)
+        status.withLock {
+            $0.focalPixels = nil
+            $0.depthRange = nil
+            $0.arkitError = nil
+            $0.calibrating = true
+        }
     }
 
     /// Claims the one model/camera switch slot, so two loads cannot swap runners concurrently.
@@ -319,7 +438,8 @@ final class DepthEngine: @unchecked Sendable {
             onFrame: { [weak self] image, time, focal in
                 self?.mailbox.putDroppingUnread(
                     CameraFrame(
-                        generation: generation, image: image, captureTime: time, focalPixels: focal))
+                        generation: generation, image: image, captureTime: time, focalPixels: focal,
+                        sceneDepth: nil, confidence: nil))
             })
         cameraBox.withLock { $0 }?.stop()
         camera.start()
@@ -328,6 +448,7 @@ final class DepthEngine: @unchecked Sendable {
         status.withLock {
             $0.focalPixels = nil
             $0.depthRange = nil
+            $0.arkitError = nil
             $0.calibrating = true
         }
     }
@@ -349,6 +470,7 @@ final class DepthEngine: @unchecked Sendable {
         var processedTimes: [Double] = []
         var stepMs = 0.0
         var latencyMs = 0.0
+        var arkitError: Float?
         while true {
             let frame = mailbox.take()
             processing.lock()
@@ -362,6 +484,7 @@ final class DepthEngine: @unchecked Sendable {
                 smoother = DepthRangeSmoother()
                 processedTimes.removeAll()
                 stepMs = 0
+                arkitError = nil
             }
             if frame.generation != generation {
                 runner.stream.reset()
@@ -369,13 +492,14 @@ final class DepthEngine: @unchecked Sendable {
                 generation = frame.generation
                 warmup = 0
                 processedTimes.removeAll()
+                arkitError = nil
             }
             if takeRecalibrationRequest() {
                 smoother = DepthRangeSmoother()
             }
             do {
                 let slot = runner.pool.acquireWritable()
-                let times = try runner.process(frame.image, into: slot)
+                let times = try runner.process(frame.image, sceneDepth: frame.sceneDepth, into: slot)
                 warmup += 1
                 guard warmup >= runner.spec.window else { continue }
                 let now = CACurrentMediaTime()
@@ -393,8 +517,18 @@ final class DepthEngine: @unchecked Sendable {
                 slot.stepMs = times.preprocessMs + times.stepMs
                 slot.metricScale = Float(scale)
                 slot.depthRange = SIMD2(Float(range.lowerBound), Float(range.upperBound))
+                let comparison = frame.sceneDepth.map {
+                    depthComparison(
+                        inverseDepth: slot.inverseDepth, sceneDepth: $0, image: frame.image,
+                        confidence: frame.confidence, scale: scale, spec: runner.spec,
+                        region: regionBox.withLock { $0 })
+                }
+                slot.arkitError = comparison?.error
                 runner.pool.publish(slot)
 
+                if let measured = slot.arkitError {
+                    arkitError = arkitError.map { $0 + 0.2 * (measured - $0) } ?? measured
+                }
                 processedTimes.append(now)
                 processedTimes.removeAll { $0 < now - 2 }
                 stepMs = stepMs == 0 ? slot.stepMs : stepMs + 0.15 * (slot.stepMs - stepMs)
@@ -406,6 +540,8 @@ final class DepthEngine: @unchecked Sendable {
                     $0.latencyMs = latencyMs
                     $0.focalPixels = frame.focalPixels
                     $0.depthRange = range
+                    $0.arkitError = compareEnabled ? arkitError : nil
+                    $0.region = comparison?.region
                     $0.calibrating = false
                     $0.error = nil
                 }

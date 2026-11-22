@@ -3,7 +3,7 @@ import SwiftUI
 import UIKit
 
 enum ViewMode: Int, CaseIterable, Identifiable {
-    case camera, blend, depth
+    case camera, blend, depth, compare
 
     var id: Int { rawValue }
 
@@ -12,6 +12,7 @@ enum ViewMode: Int, CaseIterable, Identifiable {
         case .camera: "camera.fill"
         case .blend: "circle.lefthalf.filled"
         case .depth: "square.stack.3d.up.fill"
+        case .compare: "rectangle.split.2x1"
         }
     }
 
@@ -20,6 +21,7 @@ enum ViewMode: Int, CaseIterable, Identifiable {
         case .camera: "Camera"
         case .blend: "Blend"
         case .depth: "Depth"
+        case .compare: "Compare"
         }
     }
 }
@@ -34,6 +36,8 @@ final class AppModel {
     }
 
     private static let modelKey = "depthpro2.model"
+    /// The compare loupe's radius on screen, in points.
+    static let regionRadius: CGFloat = 44
 
     var phase: Phase = .loading("Preparing the on-device model…")
     var mode: ViewMode = .blend
@@ -44,12 +48,20 @@ final class AppModel {
     var selectedModel: ModelPackage?
     var showInfo = false
     var alert: String?
+    /// The compare loupe's position on screen, in points.
+    private(set) var regionPoint: CGPoint?
+    /// The same disk's place in the other pane, in points.
+    private(set) var regionMirrorPoint: CGPoint?
     private(set) var engine: DepthEngine?
     private var started = false
     @ObservationIgnored private var pollTask: Task<Void, Never>?
 
     var info: EngineInfo? { engine?.info }
     var resolutions: [Resolution] { engine?.info.resolutions ?? [] }
+    var availableModes: [ViewMode] {
+        DepthEngine.sceneDepthSupported
+            ? ViewMode.allCases : ViewMode.allCases.filter { $0 != .compare }
+    }
 
     func start() {
         guard !started, engine == nil else { return }
@@ -98,8 +110,70 @@ final class AppModel {
         start()
     }
 
+    /// Compare mode runs ARKit instead of the capture session, so switching it swaps cameras.
+    func setMode(_ newMode: ViewMode) {
+        guard newMode != mode, status.switching == nil else { return }
+        let previous = mode
+        mode = newMode
+        if previous == .compare { clearRegion() }
+        guard let engine, (newMode == .compare) != (previous == .compare) else { return }
+        Task {
+            do {
+                try await engine.setCompare(newMode == .compare)
+            } catch {
+                mode = previous
+                alert = error.localizedDescription
+            }
+        }
+    }
+
+    /// Points the compare loupe at the image under `point`. Both panes show the model's field of
+    /// view, so the touch's place within either pane names the same disk of the model image.
+    func selectRegion(at point: CGPoint, in size: CGSize) {
+        guard mode == .compare, status.switching == nil, let engine,
+              let resolution = currentResolution, size.width > 0, size.height > 0
+        else { return }
+        let turns = Self.interfaceTurns
+        let stacked = !turns.isMultiple(of: 2)
+        let pane = CGSize(width: stacked ? size.width : size.width / 2,
+                          height: stacked ? size.height / 2 : size.height)
+        let local = CGPoint(x: (point.x.truncatingRemainder(dividingBy: pane.width)) / pane.width,
+                            y: (point.y.truncatingRemainder(dividingBy: pane.height)) / pane.height)
+        let aspect = pane.width / pane.height
+        let modelAspect = CGFloat(resolution.width) / CGFloat(resolution.height)
+        let displayAspect = turns.isMultiple(of: 2) ? modelAspect : 1 / modelAspect
+        let uvScale = CGPoint(x: min(1, aspect / displayAspect), y: min(1, displayAspect / aspect))
+        let display = CGPoint(x: (local.x - 0.5) * uvScale.x + 0.5,
+                              y: (local.y - 0.5) * uvScale.y + 0.5)
+        let uv: CGPoint = switch turns {
+        case 1: CGPoint(x: display.y, y: 1 - display.x)
+        case 2: CGPoint(x: 1 - display.x, y: 1 - display.y)
+        case 3: CGPoint(x: 1 - display.y, y: display.x)
+        default: display
+        }
+        let width = CGFloat(resolution.width)
+        let height = CGFloat(resolution.height)
+        let pixelsPerPoint = uvScale.x * (turns.isMultiple(of: 2) ? width : height) / pane.width
+        let mirror = stacked
+            ? CGPoint(x: 0, y: point.y < size.height / 2 ? pane.height : -pane.height)
+            : CGPoint(x: point.x < size.width / 2 ? pane.width : -pane.width, y: 0)
+        regionPoint = point
+        regionMirrorPoint = CGPoint(x: point.x + mirror.x, y: point.y + mirror.y)
+        engine.setRegion(
+            DepthRegion(
+                center: SIMD2(Float(uv.x * width), Float(uv.y * height)),
+                radius: Float(Self.regionRadius * pixelsPerPoint)))
+    }
+
+    func clearRegion() {
+        regionPoint = nil
+        regionMirrorPoint = nil
+        engine?.setRegion(nil)
+    }
+
     func select(_ resolution: Resolution) {
         guard let engine, resolution != currentResolution, status.switching == nil else { return }
+        clearRegion()
         Task {
             do {
                 try await engine.select(resolution)
@@ -112,6 +186,7 @@ final class AppModel {
 
     func selectModel(_ package: ModelPackage) {
         guard let engine, package != selectedModel, status.switching == nil else { return }
+        clearRegion()
         let previous = selectedModel
         selectedModel = package
         Task {
@@ -137,6 +212,13 @@ final class AppModel {
     func openSettings() {
         guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
         UIApplication.shared.open(url)
+    }
+
+    /// The renderer rotates the model into this interface; the compare loupe must do the same.
+    private static var interfaceTurns: Int {
+        guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first
+        else { fatalError("The app runs in a window scene.") }
+        return scene.interfaceOrientation.quarterTurns
     }
 
     private func poll() {

@@ -6,6 +6,7 @@ struct MetalView: UIViewRepresentable {
     let engine: DepthEngine
     let mode: Int
     let blend: Float
+    let compare: Bool
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -26,6 +27,7 @@ struct MetalView: UIViewRepresentable {
         }
         renderer.mode = mode
         renderer.blend = blend
+        renderer.compare = compare
         context.coordinator.renderer = renderer
         view.delegate = renderer
         engine.setOnFrame { [weak view] in
@@ -37,6 +39,7 @@ struct MetalView: UIViewRepresentable {
     func updateUIView(_ view: MTKView, context: Context) {
         context.coordinator.renderer.mode = mode
         context.coordinator.renderer.blend = blend
+        context.coordinator.renderer.compare = compare
         view.setNeedsDisplay()
     }
 
@@ -53,7 +56,15 @@ private struct RenderUniforms {
     var quarterTurns: Int32
 }
 
-private extension UIInterfaceOrientation {
+private struct MetersUniforms {
+    var nearFar: SIMD2<Float>
+    var uvScale: SIMD2<Float>
+    var cropScale: SIMD2<Float>
+    var cropOffset: SIMD2<Float>
+    var quarterTurns: Int32
+}
+
+extension UIInterfaceOrientation {
     /// Quarter turns from the camera's native landscape-right buffer to this interface.
     var quarterTurns: Int {
         switch self {
@@ -69,19 +80,26 @@ private extension UIInterfaceOrientation {
 final class Renderer: NSObject, MTKViewDelegate {
     private let gpu: GPU
     private let engine: DepthEngine
-    private let pipeline: MTLRenderPipelineState
+    private let depthPipeline: MTLRenderPipelineState
+    private let metersPipeline: MTLRenderPipelineState
     var mode = 2
     var blend: Float = 0.8
+    var compare = false
 
     init(gpu: GPU, engine: DepthEngine) throws {
         self.gpu = gpu
         self.engine = engine
+        depthPipeline = try Self.pipeline(gpu: gpu, fragment: "display")
+        metersPipeline = try Self.pipeline(gpu: gpu, fragment: "display_meters")
+        super.init()
+    }
+
+    private static func pipeline(gpu: GPU, fragment: String) throws -> MTLRenderPipelineState {
         let descriptor = MTLRenderPipelineDescriptor()
         descriptor.vertexFunction = gpu.library.makeFunction(name: "fullscreen")
-        descriptor.fragmentFunction = gpu.library.makeFunction(name: "display")
+        descriptor.fragmentFunction = gpu.library.makeFunction(name: fragment)
         descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
-        pipeline = try gpu.device.makeRenderPipelineState(descriptor: descriptor)
-        super.init()
+        return try gpu.device.makeRenderPipelineState(descriptor: descriptor)
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
@@ -101,25 +119,84 @@ final class Renderer: NSObject, MTKViewDelegate {
             return
         }
         let turns = view.window?.windowScene?.interfaceOrientation.quarterTurns ?? 0
-        let screenAspect = Double(drawable.texture.width) / Double(drawable.texture.height)
-        let modelAspect = Double(slot.camera.width) / Double(slot.camera.height)
-        let displayAspect = turns.isMultiple(of: 2) ? modelAspect : 1 / modelAspect
-        var uniforms = RenderUniforms(
-            scaleNearFar: SIMD3(slot.metricScale, slot.depthRange.x, slot.depthRange.y),
-            mode: Float(mode),
-            blend: blend,
-            uvScale: SIMD2(
-                Float(min(1, screenAspect / displayAspect)),
-                Float(min(1, displayAspect / screenAspect))),
-            quarterTurns: Int32(turns))
-        encoder.setRenderPipelineState(pipeline)
-        encoder.setFragmentTexture(slot.camera, index: 0)
-        encoder.setFragmentTexture(slot.inverseDepthTexture, index: 1)
-        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<RenderUniforms>.stride, index: 0)
-        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        let size = (width: Double(drawable.texture.width), height: Double(drawable.texture.height))
+        if compare {
+            // Portrait stacks the two panes; landscape puts them side by side.
+            let stacked = !turns.isMultiple(of: 2)
+            let pane = stacked
+                ? (x: 0.0, y: 0.0, width: size.width, height: size.height / 2)
+                : (x: 0.0, y: 0.0, width: size.width / 2, height: size.height)
+            drawDepth(slot, encoder: encoder, turns: turns, pane: pane, mode: 2)
+            drawARKit(
+                slot, encoder: encoder, turns: turns,
+                pane: stacked
+                    ? (x: 0.0, y: size.height / 2, width: pane.width, height: pane.height)
+                    : (x: size.width / 2, y: 0.0, width: pane.width, height: pane.height))
+        } else {
+            drawDepth(
+                slot, encoder: encoder, turns: turns,
+                pane: (x: 0.0, y: 0.0, width: size.width, height: size.height), mode: Float(mode))
+        }
         encoder.endEncoding()
         commands.addCompletedHandler { _ in pool.release(slot) }
         commands.present(drawable)
         commands.commit()
+    }
+
+    private func drawDepth(
+        _ slot: ResultSlot, encoder: MTLRenderCommandEncoder, turns: Int,
+        pane: (x: Double, y: Double, width: Double, height: Double), mode: Float
+    ) {
+        let aspect = pane.width / pane.height
+        let modelAspect = Double(slot.camera.width) / Double(slot.camera.height)
+        let displayAspect = turns.isMultiple(of: 2) ? modelAspect : 1 / modelAspect
+        var uniforms = RenderUniforms(
+            scaleNearFar: SIMD3(slot.metricScale, slot.depthRange.x, slot.depthRange.y),
+            mode: mode,
+            blend: blend,
+            uvScale: SIMD2(
+                Float(min(1, aspect / displayAspect)),
+                Float(min(1, displayAspect / aspect))),
+            quarterTurns: Int32(turns))
+        encoder.setViewport(MTLViewport(
+            originX: pane.x, originY: pane.y, width: pane.width, height: pane.height,
+            znear: 0, zfar: 1))
+        encoder.setRenderPipelineState(depthPipeline)
+        encoder.setFragmentTexture(slot.camera, index: 0)
+        encoder.setFragmentTexture(slot.inverseDepthTexture, index: 1)
+        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<RenderUniforms>.stride, index: 0)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+    }
+
+    private func drawARKit(
+        _ slot: ResultSlot, encoder: MTLRenderCommandEncoder, turns: Int,
+        pane: (x: Double, y: Double, width: Double, height: Double)
+    ) {
+        // Crop the 4:3 depth map to the model's field of view, so both panes line up.
+        let arkit = slot.arkitDepth
+        let fill = fillScale(
+            from: (width: arkit.width, height: arkit.height),
+            to: (width: slot.camera.width, height: slot.camera.height))
+        let crop = SIMD2(
+            Float(min(1, Double(slot.camera.width) / (fill * Double(arkit.width)))),
+            Float(min(1, Double(slot.camera.height) / (fill * Double(arkit.height)))))
+        let aspect = pane.width / pane.height
+        let modelAspect = Double(slot.camera.width) / Double(slot.camera.height)
+        let displayAspect = turns.isMultiple(of: 2) ? modelAspect : 1 / modelAspect
+        var uniforms = MetersUniforms(
+            nearFar: slot.depthRange,
+            uvScale: SIMD2(
+                Float(min(1, aspect / displayAspect)),
+                Float(min(1, displayAspect / aspect))),
+            cropScale: crop,
+            cropOffset: (SIMD2<Float>(repeating: 1) - crop) / 2,
+            quarterTurns: Int32(turns))
+        encoder.setViewport(MTLViewport(
+            originX: pane.x, originY: pane.y, width: pane.width, height: pane.height,
+            znear: 0, zfar: 1))
+        encoder.setRenderPipelineState(metersPipeline)
+        encoder.setFragmentTexture(arkit, index: 0)
+        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetersUniforms>.stride, index: 0)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
     }
 }
